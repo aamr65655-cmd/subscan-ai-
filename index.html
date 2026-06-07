@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+  <meta name="theme-color" content="#0a0f1a"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="SubScan AI"/>
+  <title>SubScan AI</title>
+  <link rel="manifest" href="manifest.json"/>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{background:#0a0f1a;color:#fff;font-family:'Cairo',sans-serif;direction:rtl;min-height:100vh;}
+    @keyframes pulse-ring{0%{transform:scale(0.85);opacity:0.9;}70%{transform:scale(1.5);opacity:0;}100%{transform:scale(1.5);opacity:0;}}
+    @keyframes spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+    @keyframes fade-up{from{opacity:0;transform:translateY(16px);}to{opacity:1;transform:translateY(0);}}
+    @keyframes scan-line{0%{top:0%;opacity:1;}80%{top:92%;opacity:0.5;}100%{top:100%;opacity:0;}}
+    @keyframes corner-blink{0%,100%{opacity:1;}50%{opacity:0.3;}}
+    input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:2px;outline:none;cursor:pointer;}
+    input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;cursor:pointer;}
+  </style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+// ═══════════════════════════════════════════════
+// SUBSCAN AI - PWA
+// ═══════════════════════════════════════════════
+
+const API_KEY = ""; // اتركه فارغ — الـ API Key يُدخل من التطبيق
+
+// ─── AI Sensor Model ───────────────────────────
+function runSensorModel(s) {
+  let voidScore = 0, leakScore = 0;
+  if (s.vibration > 75) voidScore += 40; else if (s.vibration > 50) voidScore += 20;
+  if (s.moisture > 70) leakScore += 45; else if (s.moisture > 45) leakScore += 25;
+  if (s.acoustic > 65) leakScore += 35; else if (s.acoustic > 40) leakScore += 15;
+  if (s.moisture > 60 && s.vibration > 60) voidScore += 15;
+  if (s.acoustic > 55 && s.moisture > 55) leakScore += 10;
+  const max = Math.max(voidScore, leakScore);
+  const avg = (s.vibration + s.moisture + s.acoustic) / 3;
+  if (max < 20 && avg < 35) return {status:"SAFE", type:"أرض سليمة", confidence:Math.round(85+Math.random()*10), color:"#00ff9d", advice:"لا توجد مؤشرات على مشكلة تحت السطح.", emoji:"✅"};
+  if (max < 40)             return {status:"WATCH",type:"اشتباه خفيف", confidence:Math.round(45+Math.random()*20), color:"#ffcc00", advice:"يُنصح بإعادة الفحص أو تغيير نقطة القياس.", emoji:"👁️"};
+  if (leakScore >= voidScore) return {status:"ALERT",type:"تسرب محتمل 💧", confidence:Math.min(Math.round(65+leakScore),97), color:"#ff6b35", advice:"مؤشرات رطوبة وصوت — راجع خط المياه أو الصرف.", emoji:"🚨"};
+  return {status:"ALERT", type:"فراغ تحت السطح ⚠️", confidence:Math.min(Math.round(60+voidScore),97), color:"#ff3366", advice:"اهتزاز غير طبيعي — احتمال هبوط أو تجويف.", emoji:"🚨"};
+}
+
+// ─── Claude Vision API ─────────────────────────
+async function analyzeImage(base64, mime, apiKey) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","x-api-key": apiKey, "anthropic-version":"2023-06-01"},
+    body: JSON.stringify({
+      model:"claude-sonnet-4-20250514", max_tokens:1000,
+      messages:[{role:"user", content:[
+        {type:"image", source:{type:"base64", media_type:mime, data:base64}},
+        {type:"text", text:`أنت نظام ذكاء اصطناعي متخصص في الكشف عن تسربات المياه والمشاكل في البنية التحتية. حلل هذه الصورة الميدانية وأجب فقط بـ JSON بدون أي نص إضافي:
+{"status":"SAFE أو WATCH أو ALERT","type":"وصف قصير","confidence":رقم_0_97,"color":"#00ff9d أو #ffcc00 أو #ff6b35","advice":"توصية للفني","detections":["علامات مرصودة"],"zones":[{"label":"اسم","x":نسبة_0_100,"y":نسبة_0_100,"severity":"low أو medium أو high"}]}`}
+      ]}]
+    })
+  });
+  const data = await res.json();
+  if(data.error) throw new Error(data.error.message);
+  const raw = data.content.map(b=>b.text||"").join("");
+  return JSON.parse(raw.replace(/```json|```/g,"").trim());
+}
+
+// ─── State ─────────────────────────────────────
+let state = {
+  tab: "sensor",
+  sensors: {vibration:20, moisture:25, acoustic:15},
+  result: null, extra: null, scanning: false,
+  log: [], scanCount: 0,
+  apiKey: localStorage.getItem("subscan_apikey") || "",
+  showApiInput: false,
+  capturedImage: null,
+  stream: null,
+};
+
+function setState(updates) {
+  Object.assign(state, updates);
+  render();
+}
+
+// ─── Render ────────────────────────────────────
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+  app.appendChild(buildApp());
+  attachEvents();
+}
+
+function el(tag, attrs, ...children) {
+  const e = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs||{})) {
+    if (k === "style" && typeof v === "object") Object.assign(e.style, v);
+    else if (k.startsWith("data-")) e.setAttribute(k, v);
+    else if (k === "className") e.className = v;
+    else e[k] = v;
+  }
+  for (const c of children) {
+    if (c == null) continue;
+    e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+  }
+  return e;
+}
+
+function buildApp() {
+  return el("div", {style:{minHeight:"100vh",background:"#0a0f1a",fontFamily:"'Cairo',sans-serif",direction:"rtl"}},
+    buildHeader(),
+    el("div", {style:{padding:"14px", maxWidth:"480px", margin:"0 auto"}},
+      buildApiKeyBar(),
+      buildTabs(),
+      state.tab === "sensor" ? buildSensorPanel() : buildCameraPanel(),
+      state.tab === "sensor" ? buildScanButton() : el("span",{}),
+      state.result && !state.scanning ? buildResultCard() : el("span",{}),
+      state.log.length > 0 ? buildLog() : el("span",{}),
+      buildFooter()
+    )
+  );
+}
+
+function buildHeader() {
+  return el("div", {style:{padding:"16px 20px 10px", borderBottom:"1px solid #1a2535", display:"flex", justifyContent:"space-between", alignItems:"center"}},
+    el("div", {},
+      el("div", {style:{fontSize:"20px", fontWeight:"700", color:"#00d4ff", letterSpacing:"1px"}}, "⬡ SUBSCAN AI"),
+      el("div", {style:{fontSize:"10px", color:"#334455"}}, "كاشف التسربات والفراغات الذكي")
+    ),
+    el("div", {style:{textAlign:"left", fontSize:"10px", color:"#334455"}},
+      el("div",{}, "📍 24.7136° N"),
+      el("div",{}, "46.6753° E"),
+      el("div",{style:{color:"#223344"}}, `فحص #${state.scanCount}`)
+    )
+  );
+}
+
+function buildApiKeyBar() {
+  if (!state.apiKey && !state.showApiInput) {
+    return el("div", {
+      "data-action":"show-api",
+      style:{background:"#ff6b3511", border:"1px solid #ff6b3544", borderRadius:"10px",
+        padding:"10px 14px", marginBottom:"12px", cursor:"pointer", fontSize:"12px", color:"#ff6b35"}
+    }, "⚠️ لتفعيل تحليل الكاميرا — اضغط هنا لإدخال Anthropic API Key");
+  }
+  if (state.showApiInput) {
+    return el("div", {style:{background:"#0d1623", border:"1px solid #1a2535", borderRadius:"10px", padding:"12px", marginBottom:"12px"}},
+      el("div",{style:{fontSize:"11px",color:"#556677",marginBottom:"8px"}}, "🔑 أدخل Anthropic API Key"),
+      el("input",{
+        id:"api-key-input", type:"password", placeholder:"sk-ant-...",
+        value: state.apiKey,
+        style:{width:"100%", background:"#050a12", border:"1px solid #1a2535", borderRadius:"8px",
+          padding:"10px", color:"#fff", fontSize:"12px", fontFamily:"monospace", outline:"none"}
+      }),
+      el("div",{style:{display:"flex",gap:"8px",marginTop:"8px"}},
+        el("button",{"data-action":"save-api", style:{flex:"1",padding:"9px",background:"#00d4ff22",border:"1px solid #00d4ff44",borderRadius:"8px",color:"#00d4ff",fontSize:"12px",cursor:"pointer"}}, "حفظ"),
+        el("button",{"data-action":"cancel-api", style:{flex:"1",padding:"9px",background:"transparent",border:"1px solid #334455",borderRadius:"8px",color:"#556677",fontSize:"12px",cursor:"pointer"}}, "إلغاء")
+      ),
+      el("div",{style:{fontSize:"10px",color:"#334455",marginTop:"6px"}}, "يُحفظ على جهازك فقط ولا يُرسل لأي خادم آخر")
+    );
+  }
+  return el("div",{style:{background:"#00ff9d11",border:"1px solid #00ff9d33",borderRadius:"8px",padding:"7px 12px",marginBottom:"12px",display:"flex",justifyContent:"space-between",alignItems:"center"}},
+    el("span",{style:{fontSize:"11px",color:"#00ff9d"}}, "✅ API Key محفوظ"),
+    el("button",{"data-action":"show-api",style:{background:"transparent",border:"none",color:"#445566",fontSize:"11px",cursor:"pointer"}}, "تغيير")
+  );
+}
+
+function buildTabs() {
+  return el("div", {style:{display:"flex",gap:"8px",marginBottom:"14px"}},
+    ...["sensor","camera"].map(id => {
+      const active = state.tab === id;
+      const labels = {sensor:["📳 الحساسات","اهتزاز + رطوبة + صوت"], camera:["📷 الكاميرا","تحليل بصري AI"]};
+      return el("button", {
+        "data-tab": id,
+        style:{flex:"1",padding:"10px",borderRadius:"12px",cursor:"pointer",
+          background: active?"#00d4ff18":"#0d1623",
+          border: active?"1px solid #00d4ff55":"1px solid #1a2535",
+          color: active?"#00d4ff":"#445566", fontFamily:"'Cairo',sans-serif"}
+      },
+        el("div",{style:{fontSize:"13px",fontWeight:"700"}}, labels[id][0]),
+        el("div",{style:{fontSize:"10px",opacity:"0.7",marginTop:"2px"}}, labels[id][1])
+      );
+    })
+  );
+}
+
+function buildSensorPanel() {
+  const rings = [
+    {key:"vibration", label:"اهتزاز التربة", icon:"📳", color:"#a78bfa"},
+    {key:"moisture",  label:"رطوبة التربة",  icon:"💧", color:"#38bdf8"},
+    {key:"acoustic",  label:"الصوت الأكوستيكي", icon:"🔊", color:"#34d399"},
+  ];
+  return el("div", {style:{background:"#0d1623",border:"1px solid #1a2535",borderRadius:"16px",padding:"18px 12px",marginBottom:"14px"}},
+    el("div",{style:{fontSize:"11px",color:"#334455",marginBottom:"14px",textAlign:"center",letterSpacing:"1px"}}, "— قراءات الحساسات —"),
+    el("div",{style:{display:"flex",justifyContent:"space-around"}},
+      ...rings.map(r => buildRing(r))
+    ),
+    el("div",{style:{fontSize:"11px",color:"#334455",textAlign:"center",marginTop:"10px"}}, "اسحب الشرائط لمحاكاة القراءات")
+  );
+}
+
+function buildRing({key, label, icon, color}) {
+  const val = state.sensors[key];
+  const c = 2 * Math.PI * 38;
+  const offset = c - (val/100)*c;
+  const svg = `<svg width="96" height="96" style="transform:rotate(-90deg)"><circle cx="48" cy="48" r="38" fill="none" stroke="#1a2535" stroke-width="8"/><circle cx="48" cy="48" r="38" fill="none" stroke="${color}" stroke-width="8" stroke-dasharray="${c}" stroke-dashoffset="${offset}" stroke-linecap="round" style="transition:stroke-dashoffset 0.4s"/></svg>`;
+  const svgEl = el("div",{style:{position:"relative",width:"96px",height:"96px"}});
+  svgEl.innerHTML = svg;
+  const overlay = el("div",{style:{position:"absolute",inset:"0",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}},
+    el("span",{style:{fontSize:"18px"}}, icon),
+    el("span",{style:{color:"#fff",fontSize:"15px",fontWeight:"700",fontFamily:"monospace"}}, String(val))
+  );
+  svgEl.appendChild(overlay);
+  const input = el("input",{type:"range",min:"0",max:"100",value:String(val),"data-sensor":key});
+  input.style.cssText = `width:88px;accent-color:${color};cursor:pointer;`;
+  return el("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",gap:"6px"}},
+    svgEl, input,
+    el("span",{style:{color:"#8899aa",fontSize:"10px",textAlign:"center"}}, label)
+  );
+}
+
+function buildScanButton() {
+  return el("button", {
+    id:"scan-btn", "data-action":"scan",
+    disabled: state.scanning,
+    style:{width:"100%",padding:"14px",background:state.scanning?"#1a2535":"linear-gradient(135deg,#0066ff22,#00d4ff22)",
+      border:`1px solid ${state.scanning?"#1a2535":"#00d4ff55"}`,borderRadius:"12px",
+      color:state.scanning?"#334455":"#00d4ff",fontSize:"15px",fontWeight:"700",
+      cursor:state.scanning?"not-allowed":"pointer",fontFamily:"'Cairo',sans-serif",marginBottom:"14px"}
+  }, state.scanning ? "جاري الفحص..." : "▶ ابدأ الفحص الذكي");
+}
+
+function buildCameraPanel() {
+  const hasVideo = !!state.stream;
+  const hasCaptured = !!state.capturedImage;
+
+  const videoArea = el("div",{style:{position:"relative",borderRadius:"14px",overflow:"hidden",background:"#050a12",border:"1px solid #1a2535",aspectRatio:"4/3",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:"10px"}});
+
+  if (hasCaptured) {
+    const img = el("img",{src:state.capturedImage,style:{width:"100%",height:"100%",objectFit:"cover",display:"block"}});
+    videoArea.appendChild(img);
+    // AR zones
+    if (state.extra?.zones?.length && !state.scanning) {
+      state.extra.zones.forEach(z => {
+        const zc = z.severity==="high"?"#ff3366":z.severity==="medium"?"#ff6b35":"#ffcc00";
+        const dot = el("div",{style:{position:"absolute",left:`${z.x}%`,top:`${z.y}%`,transform:"translate(-50%,-50%)",pointerEvents:"none"}},
+          el("div",{style:{width:"56px",height:"56px",borderRadius:"50%",border:`2px solid ${zc}`,background:`${zc}22`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"20px",boxShadow:`0 0 14px ${zc}55`}},
+            z.severity==="high"?"🚨":z.severity==="medium"?"⚠️":"👁️"
+          ),
+          el("div",{style:{marginTop:"3px",background:"#0a0f1aee",border:`1px solid ${zc}44`,borderRadius:"5px",padding:"2px 6px",fontSize:"10px",color:zc,textAlign:"center",whiteSpace:"nowrap"}}, z.label)
+        );
+        videoArea.appendChild(dot);
+      });
+    }
+    if (state.scanning) {
+      const overlay = el("div",{style:{position:"absolute",inset:"0",background:"#0a0f1acc",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"10px"}});
+      const spinner = el("div",{style:{width:"36px",height:"36px",border:"3px solid #1a2535",borderTopColor:"#00d4ff",borderRadius:"50%",animation:"spin 0.8s linear infinite"}});
+      overlay.appendChild(spinner);
+      overlay.appendChild(el("div",{style:{fontSize:"12px",color:"#00d4ff"}}, "Claude AI يحلل الصورة..."));
+      videoArea.appendChild(overlay);
+    }
+  } else if (hasVideo) {
+    const video = document.createElement("video");
+    video.id = "camera-video";
+    video.autoplay = true; video.playsInline = true; video.muted = true;
+    video.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+    if (state.stream) video.srcObject = state.stream;
+    videoArea.appendChild(video);
+    // Scan overlay
+    const scanLine = el("div",{style:{position:"absolute",left:"0",right:"0",height:"2px",background:"linear-gradient(90deg,transparent,#00d4ff88,transparent)",animation:"scan-line 2.5s ease-in-out infinite"}});
+    const hint = el("div",{style:{position:"absolute",bottom:"10px",left:"0",right:"0",textAlign:"center",fontSize:"10px",color:"#00d4ff88",letterSpacing:"2px"}}, "SCANNING");
+    videoArea.appendChild(scanLine);
+    videoArea.appendChild(hint);
+    // Corners
+    [{top:"8px",right:"8px",borderTop:"2px solid #00d4ff",borderRight:"2px solid #00d4ff"},
+     {top:"8px",left:"8px",borderTop:"2px solid #00d4ff",borderLeft:"2px solid #00d4ff"},
+     {bottom:"8px",right:"8px",borderBottom:"2px solid #00d4ff",borderRight:"2px solid #00d4ff"},
+     {bottom:"8px",left:"8px",borderBottom:"2px solid #00d4ff",borderLeft:"2px solid #00d4ff"}
+    ].forEach(s => {
+      videoArea.appendChild(el("div",{style:{position:"absolute",width:"22px",height:"22px",animation:"corner-blink 2s infinite",...s}}));
+    });
+  } else {
+    videoArea.appendChild(el("div",{style:{textAlign:"center",color:"#334455"}},
+      el("div",{style:{fontSize:"38px",marginBottom:"8px"}}, "📷"),
+      el("div",{style:{fontSize:"12px"}}, "شغّل الكاميرا أو ارفع صورة")
+    ));
+  }
+
+  const controls = el("div",{style:{display:"flex",gap:"8px",marginBottom:"10px"}});
+
+  if (!hasVideo) {
+    controls.appendChild(el("button",{"data-action":"start-camera",style:{flex:"1",padding:"12px",background:"#00d4ff11",border:"1px solid #00d4ff44",borderRadius:"10px",color:"#00d4ff",fontSize:"13px",cursor:"pointer",fontFamily:"'Cairo',sans-serif"}}, "📷 تشغيل الكاميرا"));
+  } else {
+    controls.appendChild(el("button",{"data-action":"stop-camera",style:{flex:"1",padding:"12px",background:"#ff336611",border:"1px solid #ff336644",borderRadius:"10px",color:"#ff3366",fontSize:"13px",cursor:"pointer",fontFamily:"'Cairo',sans-serif"}}, "⏹ إيقاف"));
+  }
+
+  const uploadLabel = el("label",{style:{flex:"1",padding:"12px",background:"#a78bfa11",border:"1px solid #a78bfa44",borderRadius:"10px",color:"#a78bfa",fontSize:"13px",cursor:"pointer",fontFamily:"'Cairo',sans-serif",textAlign:"center",display:"block"}},
+    "🖼 رفع صورة"
+  );
+  const fileInput = el("input",{type:"file",accept:"image/*",id:"file-upload",style:{display:"none"}});
+  uploadLabel.appendChild(fileInput);
+  controls.appendChild(uploadLabel);
+
+  const panel = el("div",{style:{marginBottom:"14px"}}, videoArea, controls);
+
+  if (hasVideo && !hasCaptured) {
+    panel.appendChild(el("button",{"data-action":"capture",style:{width:"100%",padding:"13px",background:"linear-gradient(135deg,#0066ff22,#00d4ff22)",border:"1px solid #00d4ff55",borderRadius:"12px",color:"#00d4ff",fontSize:"14px",fontWeight:"700",cursor:"pointer",fontFamily:"'Cairo',sans-serif"}}, "🔍 التقط وحلل بالذكاء الاصطناعي"));
+  }
+  if (hasCaptured && !state.scanning) {
+    panel.appendChild(el("button",{"data-action":"reset-capture",style:{width:"100%",padding:"10px",background:"transparent",border:"1px solid #334455",borderRadius:"10px",color:"#556677",fontSize:"12px",cursor:"pointer",fontFamily:"'Cairo',sans-serif",marginTop:"6px"}}, "↩ التقاط صورة جديدة"));
+  }
+
+  if (state.camError) {
+    panel.appendChild(el("div",{style:{background:"#ff336611",border:"1px solid #ff336644",borderRadius:"10px",padding:"10px",fontSize:"12px",color:"#ff6680",textAlign:"center",marginTop:"8px"}}, `⚠️ ${state.camError}`));
+  }
+
+  return panel;
+}
+
+function buildResultCard() {
+  const r = state.result;
+  const card = el("div",{style:{background:"#0d1623",border:`1px solid ${r.color}44`,borderRadius:"16px",padding:"18px",animation:"fade-up 0.5s ease",boxShadow:`0 4px 32px ${r.color}11`,marginBottom:"14px"}});
+
+  // Pulse circle
+  const pulseWrap = el("div",{style:{position:"relative",width:"60px",height:"60px",flexShrink:"0"}});
+  if (r.status !== "SAFE") {
+    pulseWrap.appendChild(el("div",{style:{position:"absolute",inset:"0",borderRadius:"50%",border:`2px solid ${r.color}`,animation:"pulse-ring 1.5s ease-out infinite"}}));
+  }
+  pulseWrap.appendChild(el("div",{style:{width:"60px",height:"60px",borderRadius:"50%",background:`radial-gradient(circle,${r.color}22,${r.color}08)`,border:`2px solid ${r.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"26px",boxShadow:`0 0 18px ${r.color}33`,position:"relative"}}, r.emoji||"✅"));
+
+  const confBar = el("div",{style:{height:"5px",flex:"1",background:"#1a2535",borderRadius:"3px",overflow:"hidden"}});
+  const confFill = el("div",{style:{height:"100%",width:`${r.confidence}%`,background:r.color,borderRadius:"3px",transition:"width 0.8s ease"}});
+  confBar.appendChild(confFill);
+
+  const header = el("div",{style:{display:"flex",alignItems:"center",gap:"14px",marginBottom:"14px"}},
+    pulseWrap,
+    el("div",{style:{flex:"1"}},
+      el("div",{style:{fontSize:"17px",fontWeight:"700",color:r.color}}, r.type),
+      el("div",{style:{fontSize:"11px",color:"#667788",marginTop:"4px"}}, "دقة التشخيص"),
+      el("div",{style:{display:"flex",alignItems:"center",gap:"8px",marginTop:"4px"}},
+        confBar,
+        el("span",{style:{fontSize:"13px",fontWeight:"700",color:r.color,fontFamily:"monospace"}}, `${r.confidence}%`)
+      )
+    )
+  );
+  card.appendChild(header);
+
+  card.appendChild(el("div",{style:{background:"#0a0f1a",borderRadius:"10px",padding:"10px",borderRight:`3px solid ${r.color}`,fontSize:"13px",color:"#99aabb",lineHeight:"1.8",marginBottom:"12px"}}, `💡 ${r.advice}`));
+
+  if (state.extra?.detections?.length) {
+    const det = el("div",{style:{marginBottom:"12px"}},
+      el("div",{style:{fontSize:"11px",color:"#445566",marginBottom:"6px",letterSpacing:"1px"}}, "— علامات مرصودة —")
+    );
+    state.extra.detections.forEach(d => det.appendChild(el("div",{style:{fontSize:"12px",color:"#778899",padding:"2px 0",display:"flex",gap:"8px"}}, el("span",{style:{color:r.color}}, "›"), d)));
+    card.appendChild(det);
+  }
+
+  card.appendChild(el("button",{"data-action":"export",style:{width:"100%",padding:"9px",background:"transparent",border:`1px solid ${r.color}33`,borderRadius:"8px",color:r.color,fontSize:"12px",cursor:"pointer",fontFamily:"'Cairo',sans-serif"}}, "📄 تصدير التقرير"));
+  return card;
+}
+
+function buildLog() {
+  const wrap = el("div",{style:{background:"#0d1623",border:"1px solid #1a2535",borderRadius:"14px",padding:"12px 14px",marginBottom:"14px"}},
+    el("div",{style:{fontSize:"11px",color:"#334455",marginBottom:"8px",letterSpacing:"1px"}}, "— سجل الفحوصات —")
+  );
+  [...state.log].reverse().forEach(e => {
+    wrap.appendChild(el("div",{style:{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #1a253520",fontSize:"12px"}},
+      el("span",{style:{color:e.color,fontWeight:"600"}}, e.type),
+      el("span",{style:{color:"#445566",fontFamily:"monospace",fontSize:"11px"}}, `${e.conf}% • ${e.time}`)
+    ));
+  });
+  return wrap;
+}
+
+function buildFooter() {
+  return el("div",{style:{padding:"10px 12px",background:"#0d1623",border:"1px solid #1a2535",borderRadius:"12px",fontSize:"10px",color:"#334455",fontFamily:"monospace",lineHeight:"1.9"}},
+    el("div",{style:{color:"#445566",marginBottom:"4px"}}, "⚙️ معلومات الموديل"),
+    el("div",{}, "وضع الحساسات: Weighted Classifier"),
+    el("div",{}, "وضع الكاميرا: Claude Vision AI"),
+    el("div",{style:{color:"#223344",marginTop:"2px"}}, "v0.3-pwa • SubScan AI")
+  );
+}
+
+// ─── Events ────────────────────────────────────
+function attachEvents() {
+  // Tabs
+  document.querySelectorAll("[data-tab]").forEach(btn => {
+    btn.onclick = () => setState({tab: btn.dataset.tab, result:null, extra:null, capturedImage:null});
+  });
+
+  // API key
+  const showApiBtn = document.querySelector("[data-action='show-api']");
+  if (showApiBtn) showApiBtn.onclick = () => setState({showApiInput:true});
+  const saveApiBtn = document.querySelector("[data-action='save-api']");
+  if (saveApiBtn) saveApiBtn.onclick = () => {
+    const val = document.getElementById("api-key-input")?.value?.trim() || "";
+    localStorage.setItem("subscan_apikey", val);
+    setState({apiKey: val, showApiInput: false});
+  };
+  const cancelApiBtn = document.querySelector("[data-action='cancel-api']");
+  if (cancelApiBtn) cancelApiBtn.onclick = () => setState({showApiInput:false});
+
+  // Sensors
+  document.querySelectorAll("[data-sensor]").forEach(input => {
+    input.oninput = e => {
+      state.sensors[e.target.dataset.sensor] = Number(e.target.value);
+      render();
+    };
+  });
+
+  // Scan
+  const scanBtn = document.querySelector("[data-action='scan']");
+  if (scanBtn) scanBtn.onclick = () => {
+    setState({scanning:true, result:null, extra:null});
+    setTimeout(() => {
+      const res = runSensorModel(state.sensors);
+      const log = [...state.log.slice(-9), {time:new Date().toLocaleTimeString("ar-SA"), type:res.type, conf:res.confidence, color:res.color}];
+      setState({scanning:false, result:res, extra:null, log, scanCount:state.scanCount+1});
+    }, 2000);
+  };
+
+  // Camera
+  const startBtn = document.querySelector("[data-action='start-camera']");
+  if (startBtn) startBtn.onclick = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
+      state.stream = stream;
+      setState({camError:null});
+      setTimeout(() => {
+        const v = document.getElementById("camera-video");
+        if (v) v.srcObject = stream;
+      }, 50);
+    } catch(e) {
+      setState({camError:"لا يمكن الوصول للكاميرا — تأكد من إعطاء الإذن"});
+    }
+  };
+
+  const stopBtn = document.querySelector("[data-action='stop-camera']");
+  if (stopBtn) stopBtn.onclick = () => {
+    if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+    setState({stream:null, capturedImage:null, result:null, extra:null});
+  };
+
+  const captureBtn = document.querySelector("[data-action='capture']");
+  if (captureBtn) captureBtn.onclick = () => {
+    const video = document.getElementById("camera-video");
+    if (!video) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    const dataURL = canvas.toDataURL("image/jpeg", 0.85);
+    const base64 = dataURL.split(",")[1];
+    handleVisionScan(base64, "image/jpeg", dataURL);
+  };
+
+  const resetBtn = document.querySelector("[data-action='reset-capture']");
+  if (resetBtn) resetBtn.onclick = () => setState({capturedImage:null, result:null, extra:null});
+
+  // File upload
+  const fileInput = document.getElementById("file-upload");
+  if (fileInput) fileInput.onchange = e => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const dataURL = ev.target.result;
+      const base64 = dataURL.split(",")[1];
+      handleVisionScan(base64, file.type||"image/jpeg", dataURL);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Export
+  const exportBtn = document.querySelector("[data-action='export']");
+  if (exportBtn) exportBtn.onclick = () => {
+    const r = state.result; if (!r) return;
+    const lines = ["تقرير فحص - SubScan AI","=".repeat(28),
+      `التاريخ: ${new Date().toLocaleString("ar-SA")}`,
+      `رقم الفحص: #${state.scanCount}`,"",
+      `التشخيص: ${r.type}`,`الدقة: ${r.confidence}%`,`التوصية: ${r.advice}`];
+    if (state.extra?.detections?.length) {
+      lines.push("","علامات مرصودة:");
+      state.extra.detections.forEach(d => lines.push(`  • ${d}`));
+    }
+    lines.push("=".repeat(28));
+    const blob = new Blob([lines.join("\n")],{type:"text/plain;charset=utf-8"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `subscan_${state.scanCount}.txt`;
+    a.click();
+  };
+}
+
+async function handleVisionScan(base64, mime, dataURL) {
+  if (!state.apiKey) {
+    setState({showApiInput:true, camError:"أدخل API Key أولاً لتفعيل التحليل البصري"});
+    return;
+  }
+  setState({scanning:true, result:null, extra:null, capturedImage:dataURL});
+  try {
+    const res = await analyzeImage(base64, mime, state.apiKey);
+    const log = [...state.log.slice(-9), {time:new Date().toLocaleTimeString("ar-SA"), type:res.type, conf:res.confidence, color:res.color}];
+    setState({scanning:false, result:{status:res.status,type:res.type,confidence:res.confidence,color:res.color,advice:res.advice,emoji:res.status==="SAFE"?"✅":res.status==="WATCH"?"👁️":"🚨"}, extra:{detections:res.detections||[],zones:res.zones||[]}, log, scanCount:state.scanCount+1});
+  } catch(e) {
+    setState({scanning:false, result:{status:"WATCH",type:"خطأ في التحليل",confidence:0,color:"#ffcc00",advice:`تعذّر الاتصال: ${e.message}`,emoji:"⚠️"}, extra:null});
+  }
+}
+
+// ─── PWA Service Worker ────────────────────────
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(()=>{});
+  });
+}
+
+// ─── Boot ──────────────────────────────────────
+render();
+</script>
+</body>
+</html>
